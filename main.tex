@@ -1,0 +1,397 @@
+%! TEX program = xelatex
+\documentclass[fleqn]{article}
+\usepackage{geometry}
+\geometry{
+ a4paper,
+ total={170mm,257mm},
+ left=20mm,
+ top=20mm,
+}
+\usepackage{setspace} % setstretch
+
+\usepackage{graphicx}
+\usepackage{kotex}
+\usepackage{csquotes}
+\usepackage{galois}
+
+\usepackage{tabularray}
+\UseTblrLibrary{booktabs}
+\UseTblrLibrary{counter}
+
+% \usepackage{biblatex}
+% \addbibresource{citations.bib}
+
+%%% Math settings
+\usepackage{amssymb,amsmath,amsthm,mathtools} % Before unicode-math
+\usepackage[math-style=TeX,bold-style=TeX]{unicode-math}
+\newtheorem{clm}{Claim}
+\theoremstyle{definition}
+\newtheorem{defn}{Definition}
+
+%%% Font settings
+\setmainfont{Libertinus Serif}
+\setsansfont{Libertinus Sans}[Scale=MatchUppercase]
+\setmonofont{JuliaMono}[Scale=MatchLowercase]
+\setmathfont{Libertinus Math} % Before set*hangulfont
+\setmathfont{TeX Gyre Pagella Math}[range={\lbrace,\rbrace},Scale=1.1]
+\setmainhangulfont{Noto Serif CJK KR}
+\setmonohangulfont{D2Coding}
+
+%%% PL constructs
+\usepackage{ebproof}
+\ebproofset{left label template=\textsc{[\inserttext]}}
+
+% For simplebnf
+\newfontfamily{\fallbackfont}{EB Garamond}
+\DeclareTextFontCommand{\textfallback}{\fallbackfont}
+\usepackage{newunicodechar}
+\newunicodechar{⩴}{\textfallback{⩴}}
+
+\usepackage{simplebnf}[2022/05/08]
+\RenewDocumentCommand\SimpleBNFDefEq{}{\ensuremath{⩴}}
+
+% because of simplebnf
+\newcommand*\vbar{|}
+\newcommand*{\finto}{\xrightarrow{\text{\textrm{fin}}}}
+\newcommand*{\istype}{\mathrel{⩴}}
+\newcommand*{\ortype}{\mathrel{|}}
+
+%%% Code display settings
+\usepackage{listings}
+\lstset{
+  language=Verilog,
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  }
+
+% for complement
+\newcommand*{\loverbar}[1]{\mkern 1.5mu\overline{\mkern-1.5mu#1\mkern-1.5mu}\mkern 1.5mu}
+
+% for continuous functions
+\newcommand*{\contcpo}[2]{{#1}\xrightarrow{\text{cont}}{#2}}
+
+% for finite functions
+\newcommand*{\fin}[2]{{#1}\xrightarrow{\text{fin}}{#2}}
+
+% for denotational semantics
+\newcommand*{\denot}[1]{\lBrack{#1}\rBrack}
+
+% new \oset macro:
+\makeatletter
+\newcommand{\oset}[3][0ex]{%
+  \mathrel{\mathop{#3}\limits^{
+    \vbox to#1{\kern-2\ex@
+    \hbox{$\scriptstyle#2$}\vss}}}}
+\makeatother
+
+% for flatmap over sets
+\newcommand*{\flatwp}{\oset{\smile}{\wp}}
+
+\title{Proposal for a Simple Static Analyzer for Verilog}
+\author{서울대학교 전기$\cdot$정보공학부 2018-12602 이준협}
+\date{}
+\begin{document}
+\maketitle
+\section{What language?}
+\begin{figure}[htb]
+  \centering
+\begin{tabular}{c}
+\begin{lstlisting}
+reg [15:0] a;
+reg [15:0] b;
+initial begin
+  a = -1'b1 + {-1'b1}; // a becomes 0
+  a = -1'b1 - 1'b1; // a becomes 2^16 - 2
+  b = -1'b1 == {-1'b1}; // LHS: 1'b1, RHS: 1'b1 => b becomes 1
+  b = (-1'b1 + 2'b0) == {-1'b1}; // LHS: 2'b11, RHS: 2'b01 => b becomes 0
+end
+\end{lstlisting}
+\end{tabular}
+\caption{Verilog code illustrating why it is easy to make mistakes.}
+\end{figure}
+The above figure is a snippet of fabulous Verilog code demonstrating the obfuscated conventions set by the IEEE committee for determining bit-width. Declaration of variables must always be carefully done to prevent overflow, and comparison operators must be used while considering whether all operands are signed or not. It is relatively easy, therefore, to make mistakes that create a state that can never be escaped from. For example, a variable with bit width $4$ compared with $16$ will always result in the result being evaluated to $1$.
+
+\section{What property?}
+For each expression $e$, we want to identify the bit-width, signedness, and range of the expression. Furthermore, if for each state we overapproximate the memories that can enter the state, and after executing the command the changed memories may enter that state again, the state may not be escapable from.
+
+\section{Abstract Syntax}
+\begin{bnfgrammar}
+  $w$: Width \in \mathbb{N}_0
+  ;;
+  $n$: Integer value \in \mathbb{Z}
+  ;;
+  $\circledcirc$: Binary operation \in \{+, -, \&, \&\&, ==, <\}
+  ;;
+  $P$ ::= \texttt{always @(posedge clk) }$C$ : program, at every rising edge do $C$
+  ;;
+  $C$ ::= $(S)^{*}$ $(1\Rightarrow\varepsilon)$ : command
+  ;;
+  $S$ ::= $E\Rightarrow A^{*}$ : state, when $E \neq 0$ perform assignments
+  ;;
+  $A$ ::= $x[w\colon w]\coloneq E$ : assignment of $x$ from index $w_{1}$ to $w_{1}+w_{2}-1$
+  ;;
+  $E$ ::= $(w, s, n)$ : signed integer with width $w$ and value $n$
+  | $(w, u, n)$ : unsigned integer with width $w$ and value $n$
+  | $x$ : variable
+  | $x[E\colon w]$ : part-selection from index $E$ to $E+w-1$
+  | $E \circledcirc E$ : binary operation
+  | $\{E^{+}\}$ : concatenation
+\end{bnfgrammar}
+
+Note that for each variable, there can be only \underline{one} assignment to it in a single state. Multiple drivers result in undefined behavior! (What would happen if one assignment wants to drive the flip-flop high but some other assignment tries to drive the flip-flop low?)
+
+\section{Concrete Semantics}
+In Verilog, every expression needs to have a statically determined width and a signedness interpretation. In hardware terms, it corresponds to how many wires the expression will require and what the arithmetic comparison operations will do. Will \texttt{0xffff} be interpreted as $-1$ or will it be interpreted as $2^{16}-1$? Thus the semantic domains are all annotated with their width and signedness.
+
+$\text{Var}=\text{PgmVar}\rightarrow\text{Width}\times\text{Signed}\subset\text{PgmVar}\times\text{Width}\times\text{Signed}$ is the set of program variables in the program of interest($\text{PgmVar}$) annotated with their bit-width($\text{Width}=\mathbb{N}_{0}$) and their signed-ness($\text{Signed}=\{s,u\}$). Since for every expression the width and signed-ness can be determined statically, the collecting semantics only has to collect the $\mathbb{Z}$ part of the expression result. The type of the (non-collecting) semantic domains are:
+\[
+  \text{Mem}=\text{Var}\rightarrow\mathbb{Z}\\
+  \underline{C}\in\text{Mem}\rightarrow\text{Mem}\\
+  \underline{S}\in\text{Mem}\rightarrow\text{Mem}\\
+  \underline{A}\in\text{Mem}\rightarrow\text{Mem}\\
+  \underline{E}\in\text{Mem}\rightarrow\text{Width}\times\text{Signed}\times\mathbb{Z}
+\]
+
+The width and signedness of an expression is decided by the context of the expression, that is, the expression $x+y$ may or may not overflow depending on the context. If it is in a expression such as $x+y+(32,s,0)$, when $32$ is wide enough to hold the calculation result of $x+y$, the most significant bit will not be lost. However, when it is in a expression such as $x+y+(16,s,0)$ when $x$ or $y$ has a larger bit width than $16$, the result might overflow. Therefore, the integer value of the computation needs to be held in full precision \textit{until the last moment}.
+
+When the width is finally determined, the integer value needs to go through a restriction of width and sign. This restriction is defined as:
+\[
+  |\cdot| : \text{Width}\times\text{Signed}\times\mathbb{Z}\rightarrow\mathbb{Z}\\
+  |(w,u,n)| \coloneq (n\:\mathsf{mod}\: 2^{w})\\
+  |(w,s,n)| \coloneq 2\times(n\:\mathsf{mod}\: 2^{w-1}) - (n\:\mathsf{mod}\: 2^{w})
+\]
+
+Also, the notation for what state the initial memory $m$ corresponds to when it goes through the command $C$ is written as:
+\[
+  m\Rightarrow_{C} S_{i}, \text{ when }\bigwedge_{j<i}[|\underline{E_{j}}m|=0]\wedge[|\underline{E_{i}}m|\neq 0]
+\]
+and we read this as ``the memory $m$ is \textit{matched with} state $S_{i}$''.
+
+A Verilog program $P$ with initial memory $m$ corresponds to the infinite sequence $\underline{P}m\coloneq\{m_{i}\}_{i\ge 0}$ with $m_{0}\coloneq m$, $m_{i+1}\coloneq\underline{C}m_{i}(i\ge 0)$. We want to check if there exists a state $S_{i}$ (except the trivial last state) such that if $m\Rightarrow_{C}S_{i}$, then $\forall n\ge 0,m_{n}\Rightarrow_{C}S_{i}$.
+
+Such a state can only exist if an external signal stalls the state machine, for example when reading from an external server gets abruptly disconnected due to physical failure.
+
+Now we dive into the actual definitions for the semantic functions.
+
+\subsection{Semantic function for expressions}
+In this section the recursive definition for $\underline{E}$ will be given.
+
+\textit{Notation:} $\underline{E_{i}}m=(w_{i},\sigma_{i},n_{i})$, $\sigma_{1}\sqcup \sigma_{2}\coloneq (\sigma_{1}=\sigma_{2}=s ? s : u)$
+\begin{align*}
+  m&\in \text{Mem}\\
+  \underline{(w,u,n)}m&\coloneq (w,u,n)\\
+  \underline{(w,s,n)}m&\coloneq (w,s,n)\\
+  \underline{x}m&\coloneq (w_{x},\sigma_{x},m(w_{x},\sigma_{x},x))&(w_{x},\sigma_{x},x)\in\text{Dom}(m)\\
+  \underline{x[E:w]}m&\coloneq (w, u, |(w,u,\lfloor 2^{-|\underline{E}m|}m(w_{x},\sigma_{x},x)\rfloor)|)&(w_{x},\sigma_{x},x)\in\text{Dom}(m)\\
+  \underline{E_{1}+E_{2}}m&\coloneq (\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup \sigma_{2}, n_{1}+n_{2})\\
+  \underline{E_{1}-E_{2}}m&\coloneq (\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup \sigma_{2}, n_{1}-n_{2})\\
+  \underline{E_{1}\& E_{2}}m&\coloneq \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},\sum_{i\ge 0}2^{i}\left(\left\lfloor\frac{n_{1}}{2^{i}}\right\rfloor-2\left\lfloor\frac{n_{1}}{2^{i+1}} \right\rfloor\right)\left(\left\lfloor\frac{n_{2}}{2^{i}}\right\rfloor-2\left\lfloor\frac{n_{2}}{2^{i+1}} \right\rfloor\right)\right)&\text{when }n_{1}\ge 0\lor n_{2}\ge 0\\
+   &\coloneq \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},\sum_{i\ge 0}2^{i}\left(\left(\left\lfloor\frac{n_{1}}{2^{i}}\right\rfloor-2\left\lfloor\frac{n_{1}}{2^{i+1}} \right\rfloor\right)\left(\left\lfloor\frac{n_{2}}{2^{i}}\right\rfloor-2\left\lfloor\frac{n_{2}}{2^{i+1}} \right\rfloor\right)-1\right)-1\right)&\text{otherwise}\\
+  \underline{E_{1}\&\& E_{2}}m&\coloneq(1, u, |(\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup\sigma_{2}, n_{1})|=0\lor|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, n_{2})|=0 ? 0 : 1)\\
+  \underline{E_{1}==E_{2}}m&\coloneq(1, u, |(\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup\sigma_{2}, n_{1})|=|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, n_{2})| ? 1 : 0)\\
+  \underline{E_{1}<E_{2}}m&\coloneq(1, u, |(\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup\sigma_{2}, n_{1})|<|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, n_{2})| ? 1 : 0)\\
+  \underline{\{E_{1},\cdots,E_{n}\}}m&\coloneq \left(\sum_{i=1}^{n}{w_{i}}, u, \sum_{i=1}^{n}2^{\sum_{0\le j<i}w_{j}}|(w_{i},u,n_{i})|\right)
+\end{align*}
+
+As can be seen, \textit{when} the restriction operation $|\cdot|$ is performed is a subtle issue that can possibly change the result of the computation. The rules above model the specification of Verilog well but is not exactly compliant with the IEEE specs. For example, performing $(2, s, -1)+(2, u, 3)-(3, u, 7)$ does not work by reducing $(2, s, -1)+(2, u, 3)$ to $(2, u, 2)$ then reducing the expression to $(3, u, -5)=\mathtt{011}$. The specs mandate that the bit-width of the expression ($=3$) be determined, then all of the operands that are ``influenced'' by that operand be extended to that bit-width, then all operations are performed \textit{while} being restricted by that bit-width. So what actually happens is that $(2, s, -1)$ is sign-extended to \texttt{111}, $(2, u, 3)$ is zero-extended to \texttt{011}, and \texttt{111-011+111} is performed. \texttt{111-011=100} and \texttt{100+111=011}, so the result is \texttt{011}. This is same as what is predicted by applying $\underline{E}$.
+
+Why this works is because the result of the computation is kept with ``infinite width'' before being restricted. If $(2,s,-1)+(2,u,3)$ was prematurely restricted with width 2, then the MSB would've been lost. If one sees the definition of $\underline{E}$, the only places that restriction happens on the result of some computation $\underline{E_{i}}m$ is on (1) the index of part-selection (2) the operands of logical operators ($\&\&, ==, <$) (3) the operands for concatenation. These are the ``boundaries'' set by the IEEE specification for determining bit-width, i.e how much expressions should one consider before deciding on the maximum bit-width. One more boundary is when an expression is assigned to a variable; that case will be dealt with in the next subsection.
+\subsection{Semantic function for assignments}
+Assignments of the form $x[w_{1}:w_{2}]\coloneq E_{1}$ update the value of $x$ to
+\[
+  \left|\left(w_{x},\sigma_{x},n_{x}-\left\lfloor2^{w_{1}}\left|\underline{x[(32,u,w_{1}):w_{2}]}m\right|\right\rfloor+\left\lfloor 2^{w_{1}}\left|(w_{2},u,n_{1})\right|\right\rfloor\right)\right|
+\]
+that is, the bits from $w_{1}$ to $w_{1}+w_{2}-1$ are cleared and are filled with the lower $w_{2}$ bits of $n_{1}$.
+
+Since all assignments occur parallelly and there can only be one assignment per variable in one state, this suffices to specify the behavior of a command.
+\subsection{Semantic function for states}
+The semantic function for a state $S=E\Rightarrow A_{1}\cdots A_{n}$ is simply the composition of the semantic function of the assignments. That is, $\underline{S}\coloneq\underline{A_{1}}\circ\cdots\circ\underline{A_{n}}$.
+
+\subsection{Semantic function for commands}
+The semantic function for a command consists of first matching the memory to a state, then performing the assignments that corresponds to that state. That is,
+\[
+  \underline{C}m\coloneq\underline{S}m \text{, when }m\Rightarrow_{C}S
+\]
+Note that there is only one state $S$ satisfying $m\Rightarrow_{C}S$, since by the definition of $\Rightarrow_{C}$, the conditions for each match $\bigwedge_{j<i}[|\underline{E_{j}}m|=0]\wedge[|\underline{E_{i}}m|\neq 0]$ are mutually exclusive. Thus $\underline{C}$ is well-defined.
+
+\section{Abstract Semantics}
+Using the convention $f(A)\coloneq\{f(x)|x\in A\}$, all the semantic functions defined in the last section can be extended to a function for $\wp(\text{Mem})$. Now we overapproximate $\wp(\text{Mem})$ by defining the abstract memory domain.
+\[
+  I=\{[a,b]|a\le b, a, b\in[-\infty, \infty]\}\\
+  \text{Mem}^{\#}=\text{Var}\rightarrow I
+\]
+$\text{Mem}^{\#}$ is Galois connected with $\wp(\text{Mem})$ since $\wp(\text{Mem})$ is Galois connected with $\text{Var}\rightarrow \wp(\mathbb{Z})$, and $I$ is Galois connected with $\wp(\mathbb{Z})$.
+
+The types for the abstract semantic functions are obvious:
+\[
+  \underline{C}^{\#}\in\text{Mem}^{\#}\rightarrow\text{Mem}^{\#}\\
+  \underline{S}^{\#}\in\text{Mem}^{\#}\rightarrow\text{Mem}^{\#}\\
+  \underline{A}^{\#}\in\text{Mem}^{\#}\rightarrow\text{Mem}^{\#}\\
+  \underline{E}^{\#}\in\text{Mem}^{\#}\rightarrow\text{Width}\times\text{Signed}\times I
+\]
+
+The abstract restriction function must also be defined:
+\[
+  |(w,u,[a,b])|^{\#}\coloneq
+  \begin{cases}
+    [0, 2^{w}-1]&(b-a\ge 2^{w}-1)\\
+    [0, 2^{w}-1]&(b-a < 2^{w}-1\wedge |(w,u,a)|\ge|(w,u,b)|)\\
+    [|(w,u,a)|,|(w,u,b)|]&(otherwise)
+  \end{cases}
+\]
+\[
+  |(w,s,[a,b])|^{\#}\coloneq
+  \begin{cases}
+    [-2^{w-1}, 2^{w-1}-1]&(b-a\ge 2^{w}-1)\\
+    [-2^{w-1}, 2^{w-1}-1]&(b-a < 2^{w}-1\wedge |(w,s,a)|\ge|(w,s,b)|)\\
+    [|(w,s,a)|,|(w,s,b)|]&(otherwise)
+  \end{cases}
+\]
+
+Now we define the abstract matching relation.
+\[
+m^{\#}\Rightarrow^{\#}_{C}S_{i}\text{, when }\bigwedge_{j<i}[0\in|\underline{E_{j}}^{\#}m^{\#}|^{\#}]\wedge[|\underline{E_{i}}^{\#}m^{\#}|^{\#}\not\sqsubseteq [0,0]]
+\]
+Note that an abstract memory can be matched with multiple states. For each state $S_{i}$ we wish to compute a memory that can match with $S_{i}$, that is, a memory $m_{i}^{\#}$ such that $[m\Rightarrow_{C}S_{i}]\Rightarrow[m\in\gamma(m_{i}^{\#})]$. The smallest $m_{i}^{\#}$ satisfying this condition will be the abstraction of the memories that are matched with $S_{i}$, that is: $\alpha(\{m|m\Rightarrow_{C}S_{i}\})$.
+\subsection{Semantic function for expressions}
+
+Note that there cannot be any infinite intervals, since all expressions must eventually be restricted by their bit-width.
+
+\textit{Notation:} $\underline{E_{i}}^{\#}m^{\#}=(w_{i},\sigma_{i},[a_{i},b_{i}])$, $m^{\#}(w_{x},\sigma_{x},x)=[a_{x},b_{x}]$
+\begin{align*}
+  m^{\#}\in&\text{Mem}^{\#}\\
+  \underline{(w,u,n)}^{\#}m^{\#}\coloneq&(w,u,[n,n])\\
+  \underline{(w,s,n)}^{\#}m^{\#}\coloneq&(w,s,[n,n])\\
+  \underline{x}^{\#}m^{\#}\coloneq& (w_{x},\sigma_{x},m^{\#}(w_{x},\sigma_{x},x))&(w_{x},\sigma_{x},x)\in\text{Dom}(m^{\#})\\
+  \underline{x[E:w]}^{\#}m^{\#}\coloneq& (w, u, |(w,u,[\min\{\lfloor 2^{-a}a_{x}\rfloor,\lfloor2^{-b}a_{x}\rfloor\},\max\{\lfloor 2^{-a}b_{x}\rfloor,\lfloor2^{-b}b_{x}\rfloor\}])|^{\#})&|\underline{E}^{\#}m^{\#}|^{\#}=[a,b]\\
+  \underline{E_{1}+E_{2}}^{\#}m^{\#}\coloneq& (\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup \sigma_{2}, [a_{1}+a_{2},b_{1}+b_{2}])\\
+  \underline{E_{1}-E_{2}}^{\#}m^{\#}\coloneq& (\max\{w_{1},w_{2}\}, \sigma_{1}\sqcup \sigma_{2}, [a_{1}-b_{2},b_{1}-a_{2}])\\
+  \underline{E_{1}\& E_{2}}^{\#}m^{\#}\coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[0,\min\{b_{1},b_{2}\}]\right)&a_{1}\ge 0\wedge a_{2}\ge 0\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[0,b_{1}]\right)&a_{1}\ge 0\wedge a_{2}<0\le b_{2}\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[\max\{a_{1}+a_{2}+1, 0\},b_{1}]\right)&a_{1}\ge 0\wedge b_{2}<0\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[0, b_{2}]\right)&a_{1}<0\le b_{1}\wedge a_{2}\ge 0\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[a_{1}+a_{2}+1, \max\{b_{1},b_{2}\}]\right)&a_{1}<0\le b_{1}\wedge a_{2}< 0\le b_{2}\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[a_{1}+a_{2}+1, b_{1}]\right)&a_{1}<0\le b_{1}\wedge b_{2}<0\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[\max\{a_{1}+a_{2}+1,0\}, b_{2}]\right)&b_{1}<0\wedge a_{2}\ge 0\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[a_{1}+a_{2}+1, b_{2}]\right)&b_{1}<0\wedge a_{2}< 0\le b_{2}\\
+   \coloneq& \left(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup \sigma_{2},[a_{1}+a_{2}+1, \min\{b_{1},b_{2}\}]\right)&b_{1}<0\wedge b_{2}< 0\\
+  \underline{E_{1}\&\& E_{2}}^{\#}m^{\#}\coloneq&(1, u, [a_{1}',b_{1}']\sqsubseteq [0,0]\lor[a_{2}',b_{2}']\sqsubseteq [0,0] ? [0,0]:(&|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, [a_{i},b_{i}])|^{\#}=[a_{i}',b_{i}']\\
+        &0\not\in [a_{1}',b_{1}']\wedge 0\not\in[a_{2}',b_{2}'] ? [1,1]:[0,1]))\\
+  \underline{E_{1}==E_{2}}^{\#}m^{\#}\coloneq&(1, u, a_{1}'=b_{1}'=a_{2}'=b_{2}' ? [1,1]:(&|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, [a_{i},b_{i}])|^{\#}=[a_{i}',b_{i}']\\
+           &[a_{1}',b_{1}']\sqcap[a_{2}',b_{2}']=\bot ? [0,0] : [0,1]))\\
+  \underline{E_{1}<E_{2}}^{\#}m^{\#}\coloneq&(1, u, b_{1}'<a_{2}' ? [1,1] :(&|(\max\{w_{1},w_{2}\},\sigma_{1}\sqcup\sigma_{2}, [a_{i},b_{i}])|^{\#}=[a_{i}',b_{i}']\\
+           &b_{2}' \le a_{1}' ? [0,0]: [0,1]))\\
+  \underline{\{E_{1},\cdots,E_{n}\}}^{\#}m^{\#}\coloneq& \left(\sum_{i=1}^{n}{w_{i}}, u, \sum_{i=1}^{n}2^{\sum_{0\le j<i}w_{j}}|(w_{i},u,[a_{i},b_{i}])|^{\#}\right)&+,\times\text{ are endpoint-wise}
+\end{align*}
+\subsection{Semantic function for assignments}
+Consider the assignment $x[w_{1}:w_{2}]\coloneq E_{1}$. The operation of clearing out consecutive bits from index $w_{1}$ to $w_{1}+w_{2}-1$ of an integer $a$ is equivalent to $ \underbrace{a\:\mathsf{mod}\:2^{w_{1}}}_{\text{Lower }w_{1}\text{ bits}}+\underbrace{2^{w_{1}+w_{2}}\lfloor2^{-w_{1}-w_{2}}a}_{\text{Upper bits}}\rfloor$. Now, if we let $m^{\#}(w_{x},\sigma_{x},x)=[a_{x},b_{x}]$, the ``cleared out'' version of $x$ will be $[a_{x}',b_{x}']=|(w_{1},u,[a_{x},b_{x}])|^{\#}+[2^{w_{1}+w_{2}}\lfloor 2^{-w_{1}-w_{2}}a_{x}\rfloor,2^{w_{1}+w_{2}}\lfloor2^{-w_{1}-w_{2}}b_{x}\rfloor]$, with the addition happening endpoint-wise, and the updated version will be
+\[
+|(w_{x},\sigma_{x},[a_{x}'+a_{1}',b_{x}'+b_{1}'])|^{\#}
+\]
+when $[a_{1}',b_{1}']\coloneq|(w_{2},u,[a_{1},b_{1}])|^{\#}$.
+\subsection{Semantic function for states}
+The semantic function for a state $S=E\Rightarrow A_{1}\cdots A_{n}$ is simply the composition of the semantic function of the assignments. That is, $\underline{S}^{\#}\coloneq\underline{A_{1}}^{\#}\circ\cdots\circ\underline{A_{n}}^{\#}$.
+
+\subsection{Semantic function for commands}
+The semantic function for commands are simple. For an initial memory $m^{\#}$, collect the states that $m^{\#}$ matches with $\{S|m^{\#}\Rightarrow^{\#}_{C}S\}$, and for each state $S$, perform the assignments corresponding to that state, then join the memories after the assignments. That is,
+\[
+\underline{C}^{\#}m^{\#}\coloneq\bigsqcup_{m^{\#}\Rightarrow_{C}^{\#}S}\underline{S}^{\#}m^{\#}
+\]
+
+\section{Proofs}
+\subsection{About the restriction function}
+It is trivial to show that if $n\in\gamma([a,b])$, then for any width $w$ $|(w,u,n)|\in\gamma(|(w,u,[a,b])|^{\#})$ and $|(w,s,n)|\in\gamma(|w,s,[a,b]|^{\#})$. For intervals that go over the boundaries of width $w$, the abstract restriction function spits out the maximum interval possible, so it is trivial. For intervals that stays inside the boundary, the restriction function is an increasing function inside that interval, so the inequalities $a\le n$ and $n\le b$ are preserved after applying the restriction.
+
+\subsection{About expressions}
+We must prove that $m\in\gamma(m^{\#})\Rightarrow \underline{E}m\in\gamma(\underline{E}^{\#}m^{\#})$, when $\gamma$ preserves the width and signedness of the result and concretizes the interval part. That is, $\gamma(w,\sigma,[a,b])=\{(w,\sigma,n)|n\in\gamma_{I}([a,b])\}$.
+
+The only part that is not obvious is the bitwise and operation. For this, we need to prove some preliminary claims.
+
+\begin{clm}
+  For $n\in\mathbb{Z}$, if $n<0$,
+  \[
+    n=\sum_{i\ge 0}2^{i}\left(\left\lfloor\frac{n}{2^{i}}\right\rfloor-2\left\lfloor\frac{n}{2^{i+1}}\right\rfloor-1\right)-1
+  \]
+  and if $n\ge 0$,
+   \[
+    n=\sum_{i\ge 0}2^{i}\left(\left\lfloor\frac{n}{2^{i}}\right\rfloor-2\left\lfloor\frac{n}{2^{i+1}}\right\rfloor\right)
+  \]
+  \begin{proof}
+    Note that the partial sum
+    \[
+      \sum_{0\le i<k}2^{i}\left(\left\lfloor\frac{n}{2^{i}}\right\rfloor-2\left\lfloor\frac{n}{2^{i+1}}\right\rfloor\right)=2^{0}\left\lfloor\frac{n}{2^{0}}\right\rfloor-2^{k}\left\lfloor\frac{n}{2^{k}}\right\rfloor = n-2^{k}\left\lfloor\frac{n}{2^{k}}\right\rfloor
+    \]
+    and
+    \[
+      \sum_{0\le i<k}2^{i}\left(\left\lfloor\frac{n}{2^{i}}\right\rfloor-2\left\lfloor\frac{n}{2^{i+1}}\right\rfloor-1\right)=2^{0}\left\lfloor\frac{n}{2^{0}}\right\rfloor-2^{k}\left\lfloor\frac{n}{2^{k}}\right\rfloor-2^{k}+1 = n-2^{k}\left\lfloor\frac{n}{2^{k}}\right\rfloor-2^{k}+1
+    \]
+    Note that if $n\ge 0$, there exists a $N$ big enough that $k\ge N\Rightarrow \lfloor n/2^{k}\rfloor=0$, and if $n<0$, there exists a $N$ big enough that $k\ge N\Rightarrow \lfloor n/2^{k}\rfloor=-1$. Therefore, for big enough $k$, the first partial sum for $n\ge 0$ is equal to $n$, and the second partial sum for $n <0$ is equal to $n+1$.
+  \end{proof}
+\end{clm}
+This shows why the bitwise and operation is defined as such in section 4.1.
+
+Now, we give upper and lower bounds for $x\& y$.
+\begin{clm}
+  For $a,b\in\mathbb{Z}$,
+  \[
+  \begin{cases}
+    0\le a\&b \le \min\{a,b\}&(a,b\ge 0)\\
+    \max\{a+b+1,0\}\le a\&b \le a&(a\ge 0,b<0)\\
+    \max\{a+b+1,0\}\le a\&b \le b&(a<0,b\ge 0)\\
+    a+b+1\le a\&b \le\min\{a,b\}&(a,b<0)
+  \end{cases}
+\]
+\begin{proof}
+  First define the $i$-th bit for $a$ and $b$.
+  \[
+    a_{i}\coloneq\left\lfloor\frac{a}{2^{i}}\right\rfloor-2\left\lfloor\frac{a}{2^{i+1}}\right\rfloor\\   b_{i}\coloneq\left\lfloor\frac{b}{2^{i}}\right\rfloor-2\left\lfloor\frac{b}{2^{i+1}}\right\rfloor
+  \]
+  Since
+  \[
+    \frac{a}{2^{i+1}}-1<\left\lfloor\frac{a}{2^{i+1}}\right\rfloor\le\frac{a}{2^{i+1}}\Rightarrow\frac{a}{2^{i}}-2<2\left\lfloor\frac{a}{2^{i+1}}\right\rfloor\le\frac{a}{2^{i}}\Rightarrow0\le\frac{a}{2^{i}}-2\left\lfloor\frac{a}{2^{i+1}}\right\rfloor<2
+  \]
+  and since the equality can hold in
+  \[
+    2\left\lfloor\frac{a}{2^{i+1}}\right\rfloor\le\frac{a}{2^{i}}
+  \]
+  only when $a/2^{i}$ is an integer, replacing $a/2^{i}$ with $\lfloor a/2^{i}\rfloor$ will still make the the inequality hold, thus $0\le a_{i},b_{i}\le 1$.
+
+  Now, we consider the inequality
+  \begin{equation}
+    0\le (1-a_{i})(1-b_{i})\Rightarrow a_{i}b_{i}\ge a_{i}+b_{i}-1
+  \end{equation}
+  and
+  \begin{equation}
+    0\le a_{i}b_{i}\le a_{i}\wedge 0\le a_{i}b_{i}\le b_{i}
+  \end{equation}
+
+  Since
+  \[
+    a\&b=\sum_{i\ge0}2^{i}a_{i}b_{i}
+  \]
+  when $a,b\ge 0$, the second inequality can be applied to get $0\le a\&b\le\sum_{i\ge0}2^{i}a_{i}=a$ and $0\le a\&b\le\sum_{i\ge0}2^{i}b_{i}=b$. Thus $0\le a\&b\le\min\{a,b\}$.
+
+  When $a<0$ and $b\ge 0$, the first inequality can be applied to get the lower bound $a\&b\ge\sum_{i\ge0}2^{i}(a_{i}+b_{i}-1)=\sum_{i\ge0}2^{i}a_{i}+\sum_{i\ge0}2^{i}(b_{i}-1)-1+1=a+b+1$. Thus, we have the second claim and by symmetry, the third claim as well.
+
+  When $a,b<0$, the expression for $a\&b$ is
+  \[
+    a\&b=\sum_{i\ge0}2^{i}(a_{i}b_{i}-1)-1
+  \]
+  Since $a_{i}b_{i}-1\ge a_{i}+b_{i}-2=(a_{i}-1)+(b_{i}-1)$ by the first inequality, we have the lower bound $a\&b\ge\sum_{i\ge0}2^{i}(a_{i}-1+b_{i}-1)-2+1=a+b+1$. Also, the upper bound can be obtained by noting $a_{i}b_{i}-1\le a_{i}-1$ and $a_{i}b_{i}-1\le b_{i}-1$, thus $a\&b\le a$ and $a\&b\le b$. Thus we have the fourth claim.
+\end{proof}
+\end{clm}
+
+Applying claim 2 between intervals $[a_{1},b_{1}]$ and $[a_{2},b_{2}]$ results in the bounds specified in section 5.1.
+
+\subsection{About commands} $m\in\gamma(m^{\#})\Rightarrow\underline{A}m\in\gamma(\underline{A}^{\#}m^{\#})$ is straightforward since (1) the ``cleared out'' version of $n_{x}$ stays inside $[a_{x}',b_{x}']$, and by the soundness of the abstract expression function and the abstract restriction function (2) $|\underline{E}m|$ stays inside $[a_{1}',b_{1}']$. The only thing needed to show the soundness of the abstract command function is the soundness of the abstract matching relation $\Rightarrow_{C}^{\#}$. That is, we need to show that if $m\in\gamma(m^{\#})\wedge m\Rightarrow_{C}S_{i}$, then $m^{\#}\Rightarrow_{C}^{\#}S_{i}$. This is straightforward from the soundness of the abstract expression function, since the predicate
+$\bigwedge_{j<i}[|\underline{E_{j}}m|=0]\wedge[|\underline{E_{i}}m|\neq 0]$ will lead to $0\in|\underline{E_{j}}^{\#}m^{\#}|^{\#}$ and $|\underline{E_{i}}^{\#}m^{\#}|^{\#}\not\sqsubseteq[0,0]$.
+\section{Analysis}
+For each state $S_{i}$, we need to overapproximate $m_{i}^{\#} \coloneq \alpha(\{m | m\Rightarrow_{C} S_{i}\})$. We note that if $m\Rightarrow_{C}S_{i}$, then $\alpha(\{m\})\Rightarrow_{C}^{\#}S_{i}$. So we need to find a predicate that is a necessary condition for $m^{\#}\Rightarrow_{C}^{\#}S_{i}$, so that $m_{i}^{\#}\Rightarrow_{C}^{\#}S_{i}$ can be overapproximated. To do this, for each variable $x\in\text{PgmVar}$ make two variables $a_{x}$ and $b_{x}$ signifying $m^{\#}(w_{x},\sigma_{x},x)=[a_{x},b_{x}]$. Then note that all the semantic functions defined in section 5 are linear inequalities and linear equations, except for $\underline{x[E:w]}^{\#}m^{\#}$. In this case, the abstract semantic function is further overapproximated by sending the result to the maximum range an unsigned number with width $w$ can have, which is $[0,2^{w}-1]$. Then truly all semantic functions will have endpoints which are linear equations or linear inequalities(when $\max$ or $\min$ are used). Then the condition $m^{\#}\Rightarrow_{C}^{\#}S_{i}$ can be expressed as a system of linear inequalities in the variables $a_{x}$ and $b_{x}$, which can be solved by a solver. The ``least solution'' to this system will be the least approximation to the state $m_{i}^{\#}$.
+
+Then calculate $m^{\#}_{i}\prime \coloneq \underline{S_{i}}^{\#}M^{\#}$. If $m^{\#}_{i}\prime \sqsubseteq m^{\#}_{i}$, then state $S_{i}$ is possibly problematic. Also, if evaluating the predicate $\bigwedge_{j<i}[|\underline{E_{j}}^{\#}m_{i}'^{\#}|^{\#}=[0,0]]\wedge[0\not\in|\underline{E_{i}}^{\#}m_{i}'^{\#}|^{\#}]$ evaluates to true, then the state $S_{i}$ is \textit{definitely} problematic.
+\end{document}
+%%% Local Variables: 
+%%% coding: utf-8
+%%% mode: latex
+%%% TeX-engine: xetex
+%%% End:
